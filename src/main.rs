@@ -5,6 +5,9 @@
 #![no_std]
 #![no_main]
 
+use core::fmt::Arguments;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use cyw43_driver::setup_cyw43;
 use defmt::*;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
@@ -19,20 +22,21 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Delay;
 use embassy_time::{Duration, Timer};
+use embedded_graphics::primitives::PrimitiveStyleBuilder;
+use embedded_graphics::text::Text;
 use embedded_graphics::{
-    image::Image,
     mono_font::{ascii::*, MonoTextStyle},
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
 };
-use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_text::{
     alignment::HorizontalAlignment,
     style::{HeightMode, TextBoxStyleBuilder},
     TextBox,
 };
 use gpio::{Level, Output, Pull};
+use heapless::String;
 use static_cell::StaticCell;
 use uc8151::asynch::Uc8151;
 use uc8151::LUT;
@@ -41,12 +45,15 @@ use {defmt_rtt as _, panic_probe as _};
 
 mod cyw43_driver;
 
+pub static DISPLAY_HAS_CHANGED: AtomicBool = AtomicBool::new(true);
+pub static COUNTER: AtomicU32 = AtomicU32::new(0);
+
 type Spi0Bus = Mutex<NoopRawMutex, Spi<'static, SPI0, spi::Async>>;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    let (_device, mut control) = setup_cyw43(
+    let (_device, mut _control) = setup_cyw43(
         p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.DMA_CH0, spawner,
     )
     .await;
@@ -59,7 +66,7 @@ async fn main(spawner: Spawner) {
     let busy = Input::new(p.PIN_26, Pull::Up);
     let reset = Output::new(p.PIN_21, Level::Low);
 
-    let delay: Duration = Duration::from_secs(1);
+    let delay: Duration = Duration::from_secs(3);
     let spi = Spi::new(
         p.SPI0,
         clk,
@@ -71,13 +78,31 @@ async fn main(spawner: Spawner) {
     );
     static SPI_BUS: StaticCell<Spi0Bus> = StaticCell::new();
     let spi_bus = SPI_BUS.init(Mutex::new(spi));
-    let spi_dev = SpiDevice::new(&spi_bus, cs);
-    let mut display = Uc8151::new(spi_dev, dc, busy, reset, Delay);
+    spawner.must_spawn(run_the_display(spi_bus, cs, dc, busy, reset));
+
+    loop {
+        let count = COUNTER.load(Ordering::Relaxed);
+        COUNTER.store(count + 1, Ordering::Relaxed);
+        DISPLAY_HAS_CHANGED.store(true, Ordering::Relaxed);
+        Timer::after(delay).await;
+    }
+}
+
+#[embassy_executor::task]
+pub async fn run_the_display(
+    spi_bus: &'static Spi0Bus,
+    cs: Output<'static>,
+    dc: Output<'static>,
+    busy: Input<'static>,
+    reset: Output<'static>,
+) {
+    let spi_device = SpiDevice::new(&spi_bus, cs);
+    let mut display = Uc8151::new(spi_device, dc, busy, reset, Delay);
     info!("Resetting display");
     display.reset().await;
 
     // Initialise display. Using the default LUT speed setting
-    let test = display.setup(LUT::Internal).await;
+    let test = display.setup(LUT::Medium).await;
     if test.is_err() {
         error!("Display setup failed");
     }
@@ -90,21 +115,60 @@ async fn main(spawner: Spawner) {
         .build();
 
     // Bounding box for our text. Fill it with the opposite color so we can read the text.
-    let bounds = Rectangle::new(Point::new(10, 10), Size::new(WIDTH - 157, 0));
-    bounds
+    let static_text_bounds = Rectangle::new(Point::new(10, 50), Size::new(WIDTH, 0));
+    static_text_bounds
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(&mut display)
         .unwrap();
 
-    // Create the text box and apply styling options.
+    // Crate static text
     let text = "Hello BlueSky";
-    let text_box = TextBox::with_textbox_style(text, bounds, character_style, textbox_style);
+    let text_box =
+        TextBox::with_textbox_style(text, static_text_bounds, character_style, textbox_style);
 
     // Draw the text box.
     text_box.draw(&mut display).unwrap();
     let _ = display.update().await;
 
     loop {
-        Timer::after(delay).await;
+        if DISPLAY_HAS_CHANGED.load(Ordering::Relaxed) {
+            let count = COUNTER.load(Ordering::Relaxed);
+            let top_text: String<15> = easy_format::<15>(format_args!("Counter: {}", count));
+
+            let top_box = Rectangle::new(Point::new(0, 0), Size::new(WIDTH, 24));
+            top_box
+                .into_styled(
+                    PrimitiveStyleBuilder::default()
+                        .stroke_color(BinaryColor::Off)
+                        .fill_color(BinaryColor::On)
+                        .stroke_width(1)
+                        .build(),
+                )
+                .draw(&mut display)
+                .unwrap();
+
+            Text::new(top_text.as_str(), Point::new(8, 16), character_style)
+                .draw(&mut display)
+                .unwrap();
+
+            // Draw the counter text box.
+            let _ = display.partial_update(top_box.try_into().unwrap()).await;
+            DISPLAY_HAS_CHANGED.store(false, Ordering::Relaxed);
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
+/// Makes it easier to format strings in a single line method
+fn easy_format<const N: usize>(args: Arguments<'_>) -> String<N> {
+    let mut formatted_string: String<N> = String::<N>::new();
+    let result = core::fmt::write(&mut formatted_string, args);
+    match result {
+        Ok(_) => formatted_string,
+        Err(_) => {
+            error!("Error formatting the string");
+            //This really should be a result return type, or panic. but going keep the ball rolling
+            String::<N>::new()
+        }
     }
 }
