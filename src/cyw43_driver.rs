@@ -32,7 +32,7 @@ pub async fn setup_cyw43<'a>(
 ) -> (Device<'a>, Control<'a>) {
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
-    let btfw = include_bytes!("../cyw43-firmware/43439A0_btfw.bin");
+    // let btfw = include_bytes!("../cyw43-firmware/43439A0_btfw.bin");
 
     // To make flashing faster for development, you may want to flash the firmwares independently
     // at hardcoded addresses, instead of baking them into the program with `include_bytes!`:
@@ -50,8 +50,7 @@ pub async fn setup_cyw43<'a>(
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (net_device, _bt_device, mut control, runner) =
-        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw).await;
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
     unwrap!(spawner.spawn(cyw43_task(runner)));
 
     control.init(clm).await;
