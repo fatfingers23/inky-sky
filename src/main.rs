@@ -44,6 +44,7 @@ use uc8151::WIDTH;
 use {defmt_rtt as _, panic_probe as _};
 
 mod cyw43_driver;
+mod env;
 
 pub static DISPLAY_HAS_CHANGED: AtomicBool = AtomicBool::new(true);
 pub static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -79,6 +80,10 @@ async fn main(spawner: Spawner) {
     static SPI_BUS: StaticCell<Spi0Bus> = StaticCell::new();
     let spi_bus = SPI_BUS.init(Mutex::new(spi));
     spawner.must_spawn(run_the_display(spi_bus, cs, dc, busy, reset));
+
+    let wifi_ssid = env::env_value("WIFI_SSID");
+    let wifi_password = env::env_value("WIFI_PASSWORD");
+    println!("SSID: {}, Password: {}", wifi_ssid, wifi_password);
 
     loop {
         let count = COUNTER.load(Ordering::Relaxed);
