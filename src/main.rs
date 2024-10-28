@@ -1,24 +1,24 @@
-//! This example test the RP Pico W on board LED.
-//!
-//! It does not work with the RP Pico board.
-
 #![no_std]
 #![no_main]
 
+use core::cell::RefCell;
 use core::fmt::Arguments;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use cyw43_driver::setup_cyw43;
+use cyw43::JoinOptions;
+use cyw43_driver::{net_task, setup_cyw43};
 use defmt::*;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
-
 use embassy_executor::Spawner;
+use embassy_net::{Config, StackResources};
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio;
 use embassy_rp::gpio::Input;
 use embassy_rp::peripherals::SPI0;
 use embassy_rp::spi;
 use embassy_rp::spi::Spi;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::blocking_mutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::mutex::Mutex;
 use embassy_time::Delay;
 use embassy_time::{Duration, Timer};
@@ -37,6 +37,7 @@ use embedded_text::{
 };
 use gpio::{Level, Output, Pull};
 use heapless::String;
+use rand::RngCore;
 use static_cell::StaticCell;
 use uc8151::asynch::Uc8151;
 use uc8151::LUT;
@@ -46,15 +47,15 @@ use {defmt_rtt as _, panic_probe as _};
 mod cyw43_driver;
 mod env;
 
-pub static DISPLAY_HAS_CHANGED: AtomicBool = AtomicBool::new(true);
-pub static COUNTER: AtomicU32 = AtomicU32::new(0);
-
+pub static DISPLAY_HAS_CHANGED: AtomicBool = AtomicBool::new(false);
+pub static IP: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<String<20>>> =
+    blocking_mutex::Mutex::new(RefCell::new(String::<20>::new()));
 type Spi0Bus = Mutex<NoopRawMutex, Spi<'static, SPI0, spi::Async>>;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    let (_device, mut _control) = setup_cyw43(
+    let (net_device, mut control) = setup_cyw43(
         p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.DMA_CH0, spawner,
     )
     .await;
@@ -81,14 +82,62 @@ async fn main(spawner: Spawner) {
     let spi_bus = SPI_BUS.init(Mutex::new(spi));
     spawner.must_spawn(run_the_display(spi_bus, cs, dc, busy, reset));
 
+    let mut rng = RoscRng;
     let wifi_ssid = env::env_value("WIFI_SSID");
     let wifi_password = env::env_value("WIFI_PASSWORD");
-    println!("SSID: {}, Password: {}", wifi_ssid, wifi_password);
+    //Configures the pico to use DHCP
+    let config = Config::dhcpv4(Default::default());
+    // Generate random seed
+    let seed = rng.next_u64();
+
+    // Init network stack
+    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(
+        net_device,
+        config,
+        RESOURCES.init(StackResources::new()),
+        seed,
+    );
+
+    unwrap!(spawner.spawn(net_task(runner)));
 
     loop {
-        let count = COUNTER.load(Ordering::Relaxed);
-        COUNTER.store(count + 1, Ordering::Relaxed);
+        match control
+            .join(wifi_ssid, JoinOptions::new(wifi_password.as_bytes()))
+            .await
+        {
+            Ok(_) => break,
+            Err(err) => {
+                info!("join failed with status={}", err.status);
+            }
+        }
+    }
+
+    // Wait for DHCP, not necessary when using static IP
+    info!("waiting for DHCP...");
+    while !stack.is_config_up() {
+        Timer::after_millis(100).await;
+    }
+    info!("DHCP is now up!");
+
+    info!("waiting for link up...");
+    while !stack.is_link_up() {
+        Timer::after_millis(500).await;
+    }
+    info!("Link is up!");
+
+    info!("waiting for stack to be up...");
+    stack.wait_config_up().await;
+    let ip = stack.config_v4().unwrap().address;
+    let ip_string = easy_format::<20>(format_args!("{}", ip));
+    IP.lock(|ip| {
+        let mut ip = ip.borrow_mut();
+        ip.clear();
+        let _ = ip.push_str(&ip_string);
         DISPLAY_HAS_CHANGED.store(true, Ordering::Relaxed);
+    });
+    info!("Stack is up!");
+    loop {
         Timer::after(delay).await;
     }
 }
@@ -137,9 +186,7 @@ pub async fn run_the_display(
 
     loop {
         if DISPLAY_HAS_CHANGED.load(Ordering::Relaxed) {
-            let count = COUNTER.load(Ordering::Relaxed);
-            let top_text: String<15> = easy_format::<15>(format_args!("Counter: {}", count));
-
+            let ip = IP.lock(|ip| ip.borrow().clone());
             let top_box = Rectangle::new(Point::new(0, 0), Size::new(WIDTH, 24));
             top_box
                 .into_styled(
@@ -152,7 +199,7 @@ pub async fn run_the_display(
                 .draw(&mut display)
                 .unwrap();
 
-            Text::new(top_text.as_str(), Point::new(8, 16), character_style)
+            Text::new(ip.as_str(), Point::new(8, 16), character_style)
                 .draw(&mut display)
                 .unwrap();
 
